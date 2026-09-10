@@ -307,12 +307,18 @@ export default function App() {
     })();
   }, []);
 
+  // Menghitung berapa banyak operasi tulis (withRoom) yang sedang berjalan.
+  // Selama nilainya > 0, hasil polling diabaikan supaya tidak "menimpa
+  // balik" perubahan lokal yang baru saja dilakukan (mis. memilih combo
+  // box) dengan data lama yang sempat diambil sebelum tulisan itu selesai.
+  const pendingWritesRef = useRef(0);
+
   // polling
   useEffect(() => {
     if (screen === "game" && roomCode) {
       pollRef.current = setInterval(async () => {
         const r = await getRoom(roomCode);
-        if (r) setRoomState(r);
+        if (r && pendingWritesRef.current === 0) setRoomState(r);
       }, 2200);
       return () => clearInterval(pollRef.current);
     }
@@ -329,11 +335,16 @@ export default function App() {
   }, [roomCode]);
 
   const withRoom = async (mutator) => {
-    const r = await getRoom(roomCode);
-    if (!r) return;
-    mutator(r);
-    await setRoom(roomCode, r);
-    setRoomState(r);
+    pendingWritesRef.current += 1;
+    try {
+      const r = await getRoom(roomCode);
+      if (!r) return;
+      mutator(r);
+      await setRoom(roomCode, r);
+      setRoomState(r);
+    } finally {
+      pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
+    }
   };
 
   /* ---------- host-authority: auto-advance timer ---------- */
@@ -710,7 +721,7 @@ function ErrorText({ children }) {
    GAME ROUTER
    ============================================================ */
 function GameScreens(props) {
-  const { room, myRole, dismissedReveal, setDismissedReveal } = props;
+  const { room, myRole, myName, dismissedReveal, setDismissedReveal } = props;
   const showReveal = !!(room.startedAt && myRole && room.status !== "LOBBY" && dismissedReveal !== room.startedAt);
   return (
     <div>
@@ -722,6 +733,152 @@ function GameScreens(props) {
       {room.status === "CRIME_SETUP" && <CrimeSetupScreen {...props} />}
       {(room.status === "COLLECTION" || room.status === "PRESENTATION") && <InvestigationScreen {...props} />}
       {room.status === "GAME_END" && <ResultScreen {...props} />}
+      {/* Voice call tetap tersambung sepanjang game, dari lobby sampai selesai */}
+      <VoiceCallPanel roomCode={room.code} myName={myName} />
+    </div>
+  );
+}
+
+/* ============================================================
+   VOICE CALL (Jitsi Meet, gratis, server publik meet.jit.si)
+   ============================================================ */
+function VoiceCallPanel({ roomCode, myName }) {
+  const [minimized, setMinimized] = useState(true);
+  const [scriptReady, setScriptReady] = useState(false);
+  const [participants, setParticipants] = useState({}); // id -> { name, speaking }
+  const containerRef = useRef(null);
+  const apiRef = useRef(null);
+  const levelsRef = useRef({}); // id -> { level, at } — dibaca via interval, bukan lewat setState langsung (biar tidak re-render tiap ~100ms)
+
+  const jitsiRoomName = `cineam-app-${roomCode}`.replace(/[^a-zA-Z0-9-]/g, "");
+
+  // muat script external_api.js sekali saja
+  useEffect(() => {
+    if (window.JitsiMeetExternalAPI) { setScriptReady(true); return; }
+    let existing = document.getElementById("jitsi-external-api");
+    if (existing) {
+      existing.addEventListener("load", () => setScriptReady(true));
+      return;
+    }
+    const script = document.createElement("script");
+    script.id = "jitsi-external-api";
+    script.src = "https://meet.jit.si/external_api.js";
+    script.async = true;
+    script.onload = () => setScriptReady(true);
+    script.onerror = () => console.error("Gagal memuat Jitsi Meet external API");
+    document.body.appendChild(script);
+  }, []);
+
+  // buat instance conference sekali per room
+  useEffect(() => {
+    if (!scriptReady || !containerRef.current || apiRef.current) return;
+    const api = new window.JitsiMeetExternalAPI("meet.jit.si", {
+      roomName: jitsiRoomName,
+      parentNode: containerRef.current,
+      width: "100%",
+      height: 220,
+      userInfo: { displayName: myName || "Pemain" },
+      configOverwrite: {
+        startWithVideoMuted: true,
+        prejoinPageEnabled: false,
+        disableDeepLinking: true,
+      },
+      interfaceConfigOverwrite: {
+        TOOLBAR_BUTTONS: ["microphone", "camera", "hangup", "tileview", "chat"],
+        SHOW_JITSI_WATERMARK: false,
+        MOBILE_APP_PROMO: false,
+      },
+    });
+    apiRef.current = api;
+
+    const upsert = (id, patch) => {
+      setParticipants((prev) => ({
+        ...prev,
+        [id]: { name: "Pemain", speaking: false, ...prev[id], ...patch },
+      }));
+    };
+
+    api.addListener("videoConferenceJoined", (p) => upsert(p.id, { name: p.displayName || myName || "Kamu" }));
+    api.addListener("participantJoined", (p) => upsert(p.id, { name: p.displayName || "Pemain" }));
+    api.addListener("displayNameChange", (p) => upsert(p.id, { name: p.displayname || p.displayName || "Pemain" }));
+    api.addListener("participantLeft", (p) => {
+      setParticipants((prev) => {
+        const next = { ...prev };
+        delete next[p.id];
+        return next;
+      });
+    });
+    // event ini dikirim sangat sering (tiap ~100ms), jadi cuma disimpan
+    // ke ref dulu — status "sedang bicara" baru dihitung & di-setState
+    // lewat interval di effect terpisah supaya tidak bikin re-render berlebihan.
+    api.addListener("audioLevelsChanged", (levels) => {
+      const now = Date.now();
+      Object.entries(levels).forEach(([id, level]) => {
+        levelsRef.current[id] = { level, at: now };
+      });
+    });
+
+    return () => {
+      try { api.dispose(); } catch {}
+      apiRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scriptReady, jitsiRoomName]);
+
+  // baca buffer level audio tiap 300ms, update status "speaking" kalau berubah
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = Date.now();
+      setParticipants((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        Object.keys(next).forEach((id) => {
+          const info = levelsRef.current[id];
+          const isSpeaking = !!(info && info.level > 0.03 && now - info.at < 500);
+          if (next[id].speaking !== isSpeaking) {
+            next[id] = { ...next[id], speaking: isSpeaking };
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }, 300);
+    return () => clearInterval(t);
+  }, []);
+
+  const entries = Object.entries(participants);
+
+  return (
+    <div style={{ position: "fixed", right: 14, bottom: 14, zIndex: 60, width: minimized ? 200 : 300, fontFamily: "'Space Grotesk',sans-serif" }}>
+      <div style={{ background: "var(--clay)", border: "3px solid var(--ink)", borderRadius: 16, boxShadow: "6px 6px 0 var(--ink)", overflow: "hidden" }}>
+        <div
+          onClick={() => setMinimized((m) => !m)}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", cursor: "pointer", background: "var(--gold)", borderBottom: "3px solid var(--ink)", fontWeight: 700, fontSize: 13 }}
+        >
+          <span>🎙️ Voice Call</span>
+          <span>{minimized ? "▲" : "▼"}</span>
+        </div>
+
+        {!minimized && <div ref={containerRef} style={{ width: "100%", background: "#000" }} />}
+
+        <div style={{ padding: "8px 10px", maxHeight: 140, overflowY: "auto" }}>
+          {entries.length === 0 && (
+            <div style={{ fontSize: 12, color: "var(--ink)", opacity: 0.6 }}>Menyambungkan ke voice call...</div>
+          )}
+          {entries.map(([id, p]) => (
+            <div key={id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", fontSize: 12, fontWeight: 600 }}>
+              <span style={{
+                width: 9, height: 9, borderRadius: "50%",
+                background: p.speaking ? "var(--teal)" : "var(--clay-dark)",
+                boxShadow: p.speaking ? "0 0 0 3px rgba(31,158,137,.35)" : "none",
+                transition: "box-shadow .15s, background .15s",
+              }} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+              {p.speaking && <span style={{ color: "var(--teal)" }}>bicara</span>}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
