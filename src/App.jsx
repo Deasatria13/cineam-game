@@ -469,6 +469,10 @@ export default function App() {
 
   async function placeTile(tileKey, optionIndex) {
     await withRoom((r) => {
+      // Firebase RTDB menghapus properti bernilai null saat disimpan, jadi
+      // r.tiles bisa jadi hilang total dari database kalau semua isinya
+      // sebelumnya null. Pastikan objeknya ada sebelum ditulis.
+      if (!r.tiles) r.tiles = {};
       r.tiles[tileKey] = optionIndex;
       pushLog(r, `Forensik memperbarui petunjuk: ${SCENE_TILES[tileKey].label}.`);
     });
@@ -500,6 +504,9 @@ export default function App() {
     await withRoom((r) => {
       const correct = r.solution && r.solution.evidenceId === evidenceId && r.solution.meansId === meansId;
       result = correct;
+      // r.solveAttempts bisa hilang dari Firebase kalau sebelumnya kosong ({}),
+      // jadi pastikan ada dulu sebelum ditulis.
+      if (!r.solveAttempts) r.solveAttempts = {};
       r.solveAttempts[myId] = { evidenceId, meansId, correct, t: Date.now() };
       pushLog(r, `${myName} mencoba memecahkan kasus — ${correct ? "BENAR!" : "salah."}`);
       if (correct) {
